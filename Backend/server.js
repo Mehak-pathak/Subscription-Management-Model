@@ -25,19 +25,130 @@ app.use(bodyParser.urlencoded({ extended: true }));
 // MySQL connection
 require('dotenv').config();
 const db = mysql.createConnection({
-    host:'localhost',
-    user:'root',
-    password:'anshi@16',
-    database:'subscription_management'
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || 'anshi@16',
+    database: process.env.DB_NAME || 'subscription_management'
 });
 
-db.connect(err => {
-    if (err) {
-        console.error('Database connection failed:', err);
-        return;
-    }
-    console.log('Connected to MySQL database.');
-});
+// Function to initialize database and tables
+function initializeDatabase() {
+    return new Promise((resolve, reject) => {
+        db.connect(async (err) => {
+            if (err) {
+                console.error('Database connection failed:', err);
+                reject(err);
+                return;
+            }
+            console.log('Connected to MySQL server.');
+
+            try {
+                // Check if database exists, create if not
+                await createDatabaseIfNotExists();
+
+                // Switch to the database
+                await useDatabase();
+
+                // Create tables if they don't exist
+                await createTables();
+
+                console.log('Database initialization completed successfully.');
+                resolve();
+            } catch (error) {
+                console.error('Database initialization failed:', error);
+                reject(error);
+            }
+        });
+    });
+}
+
+function createDatabaseIfNotExists() {
+    return new Promise((resolve, reject) => {
+        const dbName = process.env.DB_NAME || 'subscription_management';
+        db.query(`CREATE DATABASE IF NOT EXISTS ${dbName}`, (err) => {
+            if (err) {
+                reject(err);
+                return;
+            }
+            console.log(`Database '${dbName}' is ready.`);
+            resolve();
+        });
+    });
+}
+
+function useDatabase() {
+    return new Promise((resolve, reject) => {
+        const dbName = process.env.DB_NAME || 'subscription_management';
+        db.query(`USE ${dbName}`, (err) => {
+            if (err) {
+                reject(err);
+                return;
+            }
+            console.log(`Using database '${dbName}'.`);
+            resolve();
+        });
+    });
+}
+
+function createTables() {
+    return new Promise((resolve, reject) => {
+        const usersTable = `
+            CREATE TABLE IF NOT EXISTS users (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(100) NOT NULL,
+                email VARCHAR(100) NOT NULL UNIQUE,
+                password VARCHAR(255) NOT NULL,
+                email_reminders_enabled BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `;
+
+        const subscriptionsTable = `
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                service_name VARCHAR(100) NOT NULL,
+                amount DECIMAL(10, 2) NOT NULL,
+                billing_date DATE NOT NULL,
+                status ENUM('Active', 'Expired') DEFAULT 'Active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                start_date DATE,
+                end_date DATE,
+                duration_days INT,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        `;
+
+        db.query(usersTable, (err) => {
+            if (err) {
+                reject(err);
+                return;
+            }
+            console.log('Users table is ready.');
+
+            db.query(subscriptionsTable, (err) => {
+                if (err) {
+                    reject(err);
+                    return;
+                }
+                console.log('Subscriptions table is ready.');
+                resolve();
+            });
+        });
+    });
+}
+
+// Initialize database when server starts
+initializeDatabase()
+    .then(() => {
+        console.log('Database setup completed. Server is ready to handle requests.');
+    })
+    .catch((error) => {
+        console.error('Failed to initialize database:', error);
+        console.log('Please check your MySQL connection and credentials.');
+        console.log('Make sure MySQL is running and the credentials in .env file are correct.');
+        process.exit(1);
+    });
 
 const saltRounds = 10;
 
@@ -145,7 +256,7 @@ const transporter = nodemailer.createTransport({
 // Function to send reminder email
 function sendReminderEmail(toEmail, serviceName, endDate) {
     const mailOptions = {
-        from: 'your_email@gmail.com', // TODO: replace with your email
+        from: process.env.EMAIL_USER || 'your_email@gmail.com', // Use email from env or fallback
         to: toEmail,
         subject: `Subscription Expiry Reminder for ${serviceName}`,
         text: `Dear user,\n\nYour subscription for ${serviceName} is going to expire on ${endDate}. Please recharge it before the expiry date to continue enjoying the service.\n\nBest regards,\nSubscription Management Team`
@@ -163,7 +274,7 @@ function sendReminderEmail(toEmail, serviceName, endDate) {
 // Function to check for subscriptions expiring in 7 days and send reminders
 function checkAndSendReminders() {
     const query = `
-    SELECT s.id, s.service_name, s.end_date, u.email, u.email_reminders_enabled
+    SELECT s.id, s.service_name, s.end_date, s.status, u.email, u.email_reminders_enabled
     FROM subscriptions s
     JOIN users u ON s.user_id = u.id
     WHERE s.status = 'Active'
@@ -177,14 +288,27 @@ function checkAndSendReminders() {
 
         const today = new Date();
         results.forEach(sub => {
-            if (!sub.end_date) return;
-            if (!sub.email_reminders_enabled) return;
+            if (!sub.end_date) {
+                console.log(`Skipping subscription id ${sub.id} (${sub.service_name}): no end_date set.`);
+                return;
+            }
+            if (!sub.email_reminders_enabled) {
+                console.log(`Skipping subscription id ${sub.id} (${sub.service_name}): email reminders disabled for user ${sub.email}.`);
+                return;
+            }
+            if (sub.status !== 'Active') {
+                console.log(`Skipping subscription id ${sub.id} (${sub.service_name}): status is ${sub.status}.`);
+                return;
+            }
             const endDate = new Date(sub.end_date);
             const diffTime = endDate - today;
             const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+            console.log(`Subscription id ${sub.id} (${sub.service_name}): end_date=${sub.end_date}, diffDays=${diffDays}, user=${sub.email}`);
             if (diffDays <= 7 && diffDays >= 0) {
                 console.log(`Sending reminder email to ${sub.email} for subscription ${sub.service_name} expiring in ${diffDays} days.`);
                 sendReminderEmail(sub.email, sub.service_name, sub.end_date);
+            } else {
+                console.log(`Skipping subscription id ${sub.id} (${sub.service_name}): diffDays ${diffDays} not in range 0-7.`);
             }
         });
     });
@@ -250,7 +374,7 @@ app.post('/api/subscriptions', authenticateToken, (req, res) => {
     }
 
     // Find user by email
-    db.query('SELECT id FROM users WHERE email = ?', [user_email], (err, results) => {
+    db.query('SELECT id, email, email_reminders_enabled FROM users WHERE email = ?', [user_email], (err, results) => {
         if (err) {
             console.error('Database error finding user:', err);
             return res.status(500).json({ message: 'Database error finding user' });
@@ -259,6 +383,8 @@ app.post('/api/subscriptions', authenticateToken, (req, res) => {
             return res.status(400).json({ message: 'User not found' });
         }
         const user_id = results[0].id;
+        const userEmail = results[0].email;
+        const emailEnabled = results[0].email_reminders_enabled;
 
         // Calculate end_date as billing_date + duration_days
         const start_date = billing_date;
@@ -272,6 +398,12 @@ app.post('/api/subscriptions', authenticateToken, (req, res) => {
                 console.error('Database error inserting subscription:', err);
                 return res.status(500).json({ message: 'Database error inserting subscription' });
             }
+
+            // Send immediate reminder email if duration <= 7 days and user has reminders enabled
+            if (duration_days <= 7 && emailEnabled) {
+                sendReminderEmail(userEmail, service_name, end_date);
+            }
+
             res.status(201).json({ message: 'Subscription added successfully' });
         });
     });
